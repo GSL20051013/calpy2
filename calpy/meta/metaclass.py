@@ -1,4 +1,5 @@
 import copy
+from functools import wraps
 import inspect
 import sys
 import types
@@ -13,6 +14,11 @@ else:
 
 _OVERLOADS_KEY = "__cy_overloads__"
 _QUANTUM_KEY = "__cy_quantum_methods__"
+_MISSING = object()
+# CPython refcount includes temporary call-stack references, so "3" maps to
+# one effective external owner for this object in our write path.
+_UNIQUE_REFCOUNT_THRESHOLD = 3
+_IMMUTABLE_CLONE_TYPES = (int, float, bool, str, bytes, tuple, frozenset, type(None), Fraction)
 
 _ALGEBRAIC_FALLBACKS = {
     "__add__": lambda self, other: other + self,
@@ -22,7 +28,7 @@ _ALGEBRAIC_FALLBACKS = {
     "__mul__": lambda self, other: other * self,
     "__rmul__": lambda self, other: self * other,
     "__truediv__": lambda self, other: self * (1 / other),
-    "__rtruediv__": lambda self, other: self.__inverse__() * other,
+    "__rtruediv__": lambda self, other: (self.__inverse__() * other) if hasattr(self, "__inverse__") else NotImplemented,
 }
 
 
@@ -62,17 +68,11 @@ class MathNamespace(dict):
         super().__setitem__(key, value)
 
 
-def _resolve_type(annotation: Any, cls: type, fn: types.FunctionType) -> Any:
+def _resolve_type(annotation: Any, cls: type) -> Any:
     if annotation in (inspect.Signature.empty, Any, object):
         return Any
     if annotation == "Self" or annotation == cls.__name__:
         return cls
-    if isinstance(annotation, str):
-        try:
-            module_globals = vars(sys.modules[fn.__module__])
-            return eval(annotation, module_globals, {cls.__name__: cls, "Self": cls})
-        except Exception:
-            return annotation
     return annotation
 
 
@@ -101,9 +101,10 @@ def _coerce_value(value: Any, annotation: Any) -> Any:
         for candidate in get_args(annotation):
             try:
                 return _coerce_value(value, candidate)
-            except Exception:
+            except (TypeError, ValueError):
                 continue
         return value
+    # Requested precision upgrade path: int/float -> Fraction.
     if annotation is Fraction and isinstance(value, (int, float)):
         return Fraction(value)
     if isinstance(annotation, type) and not isinstance(value, annotation):
@@ -116,6 +117,17 @@ def _coerce_value(value: Any, annotation: Any) -> Any:
 
 def _build_dispatcher(name: str, overloads: list[types.FunctionType], cls: type):
     signatures = [(fn, inspect.signature(fn)) for fn in overloads]
+    resolved_hints = {}
+    for fn, _ in signatures:
+        try:
+            resolved_hints[fn] = get_type_hints(
+                fn,
+                globalns=vars(sys.modules[fn.__module__]),
+                localns={cls.__name__: cls, "Self": cls},
+                include_extras=True,
+            )
+        except (NameError, TypeError, AttributeError):
+            resolved_hints[fn] = {}
 
     def dispatcher(self, *args, **kwargs):
         for fn, sig in signatures:
@@ -127,7 +139,8 @@ def _build_dispatcher(name: str, overloads: list[types.FunctionType], cls: type)
             for param_name, param in sig.parameters.items():
                 if param_name == "self" or param_name not in bound.arguments:
                     continue
-                annotation = _resolve_type(param.annotation, cls, fn)
+                annotation = resolved_hints[fn].get(param_name, param.annotation)
+                annotation = _resolve_type(annotation, cls)
                 if not _matches_annotation(bound.arguments[param_name], annotation):
                     ok = False
                     break
@@ -137,7 +150,7 @@ def _build_dispatcher(name: str, overloads: list[types.FunctionType], cls: type)
         if name in _ALGEBRAIC_FALLBACKS and len(args) == 1 and not kwargs:
             try:
                 return _ALGEBRAIC_FALLBACKS[name](self, args[0])
-            except Exception:
+            except (TypeError, AttributeError):
                 return NotImplemented
         return NotImplemented
 
@@ -182,6 +195,7 @@ class MathMeta(type):
         base_types = {}
         base_defaults = {}
         base_bounds = {}
+        base_quantum = {}
         for base in bases:
             if isinstance(base, MathMeta):
                 for field in getattr(base, "_meta_fields", ()):
@@ -190,6 +204,7 @@ class MathMeta(type):
                 base_types.update(getattr(base, "_meta_types", {}))
                 base_defaults.update(getattr(base, "_meta_defaults", {}))
                 base_bounds.update(getattr(base, "_meta_bounds", {}))
+                base_quantum.update(getattr(base, "_meta_quantum", {}))
 
         all_fields = list(base_fields)
         for field in current_fields:
@@ -203,9 +218,11 @@ class MathMeta(type):
 
         inherited = set(base_fields)
         class_slots = [field for field in current_fields if field not in inherited]
-        base_has_weakref = any("__weakref__" in getattr(base, "__slots__", ()) for base in bases)
         if "__slots__" not in raw_namespace:
-            slots = tuple(class_slots + ([] if base_has_weakref else ["__weakref__"]))
+            slots = list(class_slots)
+            if not any(isinstance(base, MathMeta) for base in bases):
+                slots.append("__weakref__")
+            slots = tuple(slots)
             raw_namespace["__slots__"] = slots
 
         cls = super().__new__(mcs, name, bases, raw_namespace)
@@ -213,14 +230,14 @@ class MathMeta(type):
         cls._meta_types = all_types
         cls._meta_defaults = all_defaults
         cls._meta_bounds = all_bounds
-        cls._meta_quantum = quantum_methods
+        cls._meta_quantum = {**base_quantum, **quantum_methods}
         cls._flyweight_pool = weakref.WeakValueDictionary()
         cls.__match_args__ = tuple(all_fields)
 
         type_hints = {}
         try:
             type_hints = get_type_hints(cls, include_extras=True)
-        except Exception:
+        except (NameError, TypeError, AttributeError):
             type_hints = dict(all_types)
         cls._meta_types = {**all_types, **{k: v for k, v in type_hints.items() if k in all_fields}}
 
@@ -281,7 +298,11 @@ class MathMeta(type):
         def clone(self):
             new_obj = object.__new__(self.__class__)
             for field in self._meta_fields:
-                object.__setattr__(new_obj, field, copy.deepcopy(getattr(self, field)))
+                field_value = getattr(self, field)
+                if isinstance(field_value, _IMMUTABLE_CLONE_TYPES):
+                    object.__setattr__(new_obj, field, field_value)
+                else:
+                    object.__setattr__(new_obj, field, copy.deepcopy(field_value))
             return new_obj
 
         setattr(cls, "__repr__", __repr__)
@@ -296,9 +317,10 @@ class MathMeta(type):
 
             def __exit__(self, exc_type, exc, tb):
                 handler = self.__with__
-                try:
+                param_count = len(inspect.signature(handler).parameters)
+                if param_count >= 3:
                     handler(exc_type, exc, tb)
-                except TypeError:
+                else:
                     handler()
                 return False
 
@@ -314,10 +336,10 @@ class MathMeta(type):
                 continue
 
             def _make_chain_wrapper(fn):
+                @wraps(fn)
                 def _wrapped(self, *args, **kwargs):
                     result = fn(self, *args, **kwargs)
                     return self if result is None else result
-                _wrapped.__name__ = fn.__name__
                 return _wrapped
 
             setattr(cls, attr_name, _make_chain_wrapper(attr_value))
@@ -327,12 +349,12 @@ class MathMeta(type):
     def __call__(cls, *args, **kwargs):
         instance = super().__call__(*args, **kwargs)
         try:
-            key = tuple(getattr(instance, field) for field in cls._meta_fields if hasattr(instance, field))
+            key = tuple(getattr(instance, field, _MISSING) for field in cls._meta_fields)
             pooled = cls._flyweight_pool.get(key)
             if pooled is not None:
                 return pooled
             cls._flyweight_pool[key] = instance
-        except Exception:
+        except (TypeError, AttributeError):
             pass
         return instance
 
@@ -362,7 +384,10 @@ class MathObject(metaclass=MathMeta):
     def __setattr__(self, name: str, value: Any) -> None:
         if name in getattr(self, "_meta_types", {}):
             value = _coerce_value(value, self._meta_types[name])
-            for validator in self._meta_bounds.get(name, ()):
+            validators = self._meta_bounds.get(name, ())
+            if callable(validators):
+                validators = (validators,)
+            for validator in validators:
                 if not validator(value):
                     raise ValueError(f"Boundary failed for '{name}' with value {value!r}")
 
@@ -375,12 +400,14 @@ class MathObject(metaclass=MathMeta):
 
         if hasattr(type(self), "_flyweight_pool"):
             try:
-                key = tuple(getattr(self, field) for field in self._meta_fields if hasattr(self, field))
-                if sys.getrefcount(self) <= 3:
-                    type(self)._flyweight_pool[key] = self
+                key = tuple(getattr(self, field, _MISSING) for field in self._meta_fields)
+                pool = type(self)._flyweight_pool
+                if sys.getrefcount(self) <= _UNIQUE_REFCOUNT_THRESHOLD:
+                    pool[key] = self
                 else:
-                    type(self)._flyweight_pool.pop(key, None)
-            except Exception:
+                    if pool.get(key) is self:
+                        pool.pop(key, None)
+            except (TypeError, AttributeError):
                 pass
 
     def __post_init__(self, *args: Any, **kwargs: Any) -> None:
