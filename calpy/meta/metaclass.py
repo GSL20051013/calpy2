@@ -6,7 +6,7 @@ import sys
 import types
 import weakref
 from fractions import Fraction
-from typing import Annotated, Any, ClassVar, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, Callable, ClassVar, get_args, get_origin, get_type_hints
 
 if sys.version_info >= (3, 11):
     from typing import dataclass_transform
@@ -119,7 +119,8 @@ def _coerce_value(value: Any, annotation: Any) -> Any:
     return value
 
 
-def _build_range_validator(lower: Any, upper: Any):
+def _build_range_validator(lower: Any, upper: Any) -> Callable[[Any], bool]:
+    """Create an inclusive min/max validator."""
     def _validator(value: Any) -> bool:
         try:
             if lower is not None and value < lower:
@@ -134,6 +135,7 @@ def _build_range_validator(lower: Any, upper: Any):
 
 
 def _parse_annotated_bounds(metadata: tuple[Any, ...]) -> list:
+    """Parse `Annotated` metadata into callable boundary validators."""
     validators = []
     numeric_limits = []
 
@@ -149,8 +151,13 @@ def _parse_annotated_bounds(metadata: tuple[Any, ...]) -> list:
         if meta is None or isinstance(meta, Number):
             numeric_limits.append(meta)
 
-    if len(numeric_limits) >= 2:
-        validators.append(_build_range_validator(numeric_limits[0], numeric_limits[1]))
+    if len(numeric_limits) > 2:
+        raise TypeError("Annotated numeric bounds accept at most two values: lower and upper.")
+    if len(numeric_limits) == 2:
+        lower, upper = numeric_limits
+        if lower is None and upper is None:
+            return validators
+        validators.append(_build_range_validator(lower, upper))
 
     return validators
 
