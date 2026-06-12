@@ -422,7 +422,7 @@ class MathMeta(type):
 
         if "__with__" in cls.__dict__:
             def __enter__(self):
-                return self
+                return self.__with__()
 
             def __exit__(self, exc_type, exc, tb):
                 handler = self.__with__

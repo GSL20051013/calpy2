@@ -4,7 +4,13 @@ from typing import Annotated
 from fractions import Fraction
 
 class Concept(MathObject):
-    name: Annotated[str,lambda x :x.islower()]
+    name:str
 
-x1 = Concept("x")
-x2 = Concept("X")
+    def __with__(self):
+        return self.clone()
+
+x1 = Concept('x')
+x2 = Concept('x')
+
+with x1 as x:
+    x.name = 'y'
