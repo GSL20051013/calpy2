@@ -163,37 +163,57 @@ def _build_dispatcher(name: str, overloads: list[types.FunctionType], cls: type)
 def _install_algebraic_fallbacks(cls: type) -> None:
     if "__add__" in cls.__dict__ and "__radd__" not in cls.__dict__:
         def __radd__(self, other):
-            return self.__add__(other)
+            try:
+                return self.__add__(other)
+            except (TypeError, AttributeError):
+                return NotImplemented
 
         setattr(cls, "__radd__", __radd__)
 
     if "__add__" in cls.__dict__ and "__sub__" not in cls.__dict__:
         def __sub__(self, other):
-            return self + (-other)
+            try:
+                return self + (-other)
+            except (TypeError, AttributeError):
+                return NotImplemented
 
         setattr(cls, "__sub__", __sub__)
 
     if "__add__" in cls.__dict__ and "__rsub__" not in cls.__dict__:
         def __rsub__(self, other):
-            return (-self) + other
+            try:
+                return (-self) + other
+            except (TypeError, AttributeError):
+                return NotImplemented
 
         setattr(cls, "__rsub__", __rsub__)
 
     if "__mul__" in cls.__dict__ and "__rmul__" not in cls.__dict__:
         def __rmul__(self, other):
-            return self.__mul__(other)
+            try:
+                return self.__mul__(other)
+            except (TypeError, AttributeError):
+                return NotImplemented
 
         setattr(cls, "__rmul__", __rmul__)
 
     if "__inverse__" in cls.__dict__ and "__truediv__" not in cls.__dict__:
         def __truediv__(self, other):
-            return self * other.__inverse__()
+            if not hasattr(other, "__inverse__"):
+                return NotImplemented
+            try:
+                return self * other.__inverse__()
+            except (TypeError, AttributeError):
+                return NotImplemented
 
         setattr(cls, "__truediv__", __truediv__)
 
     if "__inverse__" in cls.__dict__ and "__rtruediv__" not in cls.__dict__:
         def __rtruediv__(self, other):
-            return other * self.__inverse__()
+            try:
+                return other * self.__inverse__()
+            except (TypeError, AttributeError):
+                return NotImplemented
 
         setattr(cls, "__rtruediv__", __rtruediv__)
 
@@ -325,16 +345,24 @@ class MathMeta(type):
 
         setattr(cls, "__init__", __init__)
         init_params = []
+        seen_default = False
         for field in cls._meta_fields:
             annotation = cls._meta_types.get(field, inspect.Signature.empty)
+            has_default = field in cls._meta_defaults
+            default = cls._meta_defaults[field] if has_default else inspect.Parameter.empty
+            kind = inspect.Parameter.POSITIONAL_OR_KEYWORD
+            if seen_default and not has_default:
+                kind = inspect.Parameter.KEYWORD_ONLY
             init_params.append(
                 inspect.Parameter(
                     field,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    default=inspect.Parameter.empty,
+                    kind,
+                    default=default,
                     annotation=annotation,
                 )
             )
+            if has_default:
+                seen_default = True
         init_params.extend(
             (
                 inspect.Parameter("_post_args", inspect.Parameter.VAR_POSITIONAL),
