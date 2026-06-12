@@ -1,1 +1,3 @@
-from meta.metaclass import MathObject
+from .metaclass import MathMeta, MathObject
+
+__all__ = ["MathMeta", "MathObject"]
