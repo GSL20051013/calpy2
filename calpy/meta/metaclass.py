@@ -1,4 +1,6 @@
 import sys
+import types
+from functools import singledispatchmethod
 from typing import Any
 
 if sys.version_info >= (3, 11):
@@ -6,8 +8,46 @@ if sys.version_info >= (3, 11):
 else:
     from typing_extensions import dataclass_transform
 
+# A comprehensive set of math dunder methods that should support singledispatch
+MATH_DUNDERS = {
+    # Binary operators
+    '__add__', '__sub__', '__mul__', '__matmul__', '__truediv__', '__floordiv__',
+    '__mod__', '__divmod__', '__pow__', '__lshift__', '__rshift__', '__and__', '__xor__', '__or__',
+    # Reflected binary operators
+    '__radd__', '__rsub__', '__rmul__', '__rmatmul__', '__rtruediv__', '__rfloordiv__',
+    '__rmod__', '__rdivmod__', '__rpow__', '__rlshift__', '__rrshift__', '__rand__', '__rxor__', '__ror__',
+    # Augmented assignment
+    '__iadd__', '__isub__', '__imul__', '__imatmul__', '__itruediv__', '__ifloordiv__',
+    '__imod__', '__ipow__', '__ilshift__', '__irshift__', '__iand__', '__ixor__', '__ior__'
+}
+
+class MathNamespace(dict):
+    """
+    Custom dictionary for the class body namespace. Intercepts definitions of 
+    math dunder methods and wraps them in singledispatchmethod automatically.
+    """
+    def __setitem__(self, key, value):
+        # Only intercept predefined math dunders that are normal functions
+        if key in MATH_DUNDERS and isinstance(value, types.FunctionType):
+            # If the dunder is already a singledispatchmethod, register the new
+            # function to it rather than overwriting it (allows implicit overloading).
+            if key in self and isinstance(self[key], singledispatchmethod):
+                self[key].register(value)
+                return
+            
+            # Otherwise, wrap the first definition in singledispatchmethod
+            value = singledispatchmethod(value)
+            
+        super().__setitem__(key, value)
+
+
 @dataclass_transform(eq_default=True)
 class MathMeta(type):
+    
+    @classmethod
+    def __prepare__(mcs, name, bases, **kwargs):
+        # Inject our custom namespace handler during class body execution
+        return MathNamespace()
 
     def __new__(mcs, name, bases, namespace):
         annotations = namespace.get('__annotations__', {})
@@ -36,7 +76,8 @@ class MathMeta(type):
                 all_fields.append(f)
         all_defaults.update(current_defaults)
 
-        cls = super().__new__(mcs, name, bases, namespace)
+        # Convert back to a standard dict to prevent edge cases with type.__new__
+        cls = super().__new__(mcs, name, bases, dict(namespace))
 
         setattr(cls, '_meta_fields', all_fields)
         setattr(cls, '_meta_defaults', all_defaults)
