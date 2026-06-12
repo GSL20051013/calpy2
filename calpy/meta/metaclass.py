@@ -1,6 +1,7 @@
 import copy
 from functools import wraps
 import inspect
+from numbers import Number
 import sys
 import types
 import weakref
@@ -116,6 +117,42 @@ def _coerce_value(value: Any, annotation: Any) -> Any:
         except Exception:
             return value
     return value
+
+
+def _build_range_validator(lower: Any, upper: Any):
+    def _validator(value: Any) -> bool:
+        try:
+            if lower is not None and value < lower:
+                return False
+            if upper is not None and value > upper:
+                return False
+        except TypeError:
+            return False
+        return True
+
+    return _validator
+
+
+def _parse_annotated_bounds(metadata: tuple[Any, ...]) -> list:
+    validators = []
+    numeric_limits = []
+
+    for meta in metadata:
+        if callable(meta):
+            validators.append(meta)
+            continue
+        if isinstance(meta, (tuple, list)) and len(meta) == 2:
+            lower, upper = meta
+            if (lower is None or isinstance(lower, Number)) and (upper is None or isinstance(upper, Number)):
+                validators.append(_build_range_validator(lower, upper))
+            continue
+        if meta is None or isinstance(meta, Number):
+            numeric_limits.append(meta)
+
+    if len(numeric_limits) >= 2:
+        validators.append(_build_range_validator(numeric_limits[0], numeric_limits[1]))
+
+    return validators
 
 
 def _build_dispatcher(name: str, overloads: list[types.FunctionType], cls: type):
@@ -250,7 +287,7 @@ class MathMeta(type):
             if get_origin(annotation) is Annotated:
                 args = get_args(annotation)
                 current_types[field] = args[0]
-                current_bounds[field] = [meta for meta in args[1:] if callable(meta)]
+                current_bounds[field] = _parse_annotated_bounds(args[1:])
             else:
                 current_types[field] = annotation
 
