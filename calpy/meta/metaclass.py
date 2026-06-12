@@ -315,6 +315,13 @@ class MathMeta(type):
             type_hints = dict(all_types)
         cls._meta_types = {**all_types, **{k: v for k, v in type_hints.items() if k in all_fields}}
 
+        for field, hint in type_hints.items():
+            if get_origin(hint) is Annotated:
+                # Extract the type (float) and the extras (is_positive)
+                args = get_args(hint)
+                cls._meta_types[field] = args[0]
+                # Update the bounds here!
+                cls._meta_bounds[field] = [meta for meta in args[1:] if callable(meta)]
         for method_name, method_overloads in overloads.items():
             if method_name in raw_namespace and isinstance(raw_namespace[method_name], types.FunctionType):
                 method_overloads = [raw_namespace[method_name], *method_overloads[1:]]
