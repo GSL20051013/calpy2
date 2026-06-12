@@ -134,6 +134,14 @@ def _build_range_validator(lower: Any, upper: Any) -> Callable[[Any], bool]:
     return _validator
 
 
+def _validate_numeric_bounds(lower: Any, upper: Any) -> bool:
+    if lower is None and upper is None:
+        return False
+    if lower is not None and upper is not None and lower > upper:
+        raise TypeError("Annotated numeric bounds require lower <= upper.")
+    return True
+
+
 def _parse_annotated_bounds(metadata: tuple[Any, ...]) -> list:
     """Parse `Annotated` metadata into callable boundary validators."""
     validators = []
@@ -146,18 +154,22 @@ def _parse_annotated_bounds(metadata: tuple[Any, ...]) -> list:
         if isinstance(meta, (tuple, list)) and len(meta) == 2:
             lower, upper = meta
             if (lower is None or isinstance(lower, Number)) and (upper is None or isinstance(upper, Number)):
-                validators.append(_build_range_validator(lower, upper))
+                if _validate_numeric_bounds(lower, upper):
+                    validators.append(_build_range_validator(lower, upper))
+            else:
+                raise TypeError("Annotated tuple/list bounds must be numbers or None.")
             continue
         if meta is None or isinstance(meta, Number):
             numeric_limits.append(meta)
 
+    if len(numeric_limits) == 1:
+        raise TypeError("Annotated numeric bounds require both lower and upper values.")
     if len(numeric_limits) > 2:
         raise TypeError("Annotated numeric bounds accept at most two values: lower and upper.")
     if len(numeric_limits) == 2:
         lower, upper = numeric_limits
-        if lower is None and upper is None:
-            return validators
-        validators.append(_build_range_validator(lower, upper))
+        if _validate_numeric_bounds(lower, upper):
+            validators.append(_build_range_validator(lower, upper))
 
     return validators
 
