@@ -15,8 +15,8 @@ else:
 _OVERLOADS_KEY = "__cy_overloads__"
 _QUANTUM_KEY = "__cy_quantum_methods__"
 _MISSING = object()
-# CPython refcount includes temporary call-stack references, so "4" maps to
-# one effective external owner for this object in our write path.
+# CPython refcount in this write path includes several temporary stack refs;
+# threshold 4 still corresponds to one effective external owner.
 _UNIQUE_REFCOUNT_THRESHOLD = 4
 _IMMUTABLE_CLONE_TYPES = (int, float, bool, str, bytes, tuple, frozenset, type(None), Fraction)
 
@@ -91,6 +91,7 @@ def _matches_annotation(value: Any, annotation: Any) -> bool:
 
 
 def _coerce_value(value: Any, annotation: Any) -> Any:
+    # Preserve nullable behavior: explicit None is accepted without coercion.
     if value is None:
         return value
     if annotation in (Any, object, inspect.Signature.empty):
@@ -164,6 +165,11 @@ def _install_algebraic_fallbacks(cls: type) -> None:
     if "__add__" in cls.__dict__ and "__radd__" not in cls.__dict__:
         def __radd__(self, other):
             try:
+                other_add = getattr(other, "__add__", None)
+                if callable(other_add):
+                    result = other_add(self)
+                    if result is not NotImplemented:
+                        return result
                 return self.__add__(other)
             except (TypeError, AttributeError):
                 return NotImplemented
@@ -488,6 +494,7 @@ class MathObject(metaclass=MathMeta):
             for validator in validators:
                 if not validator(value):
                     raise ValueError(f"Boundary failed for '{name}' with value {value!r}")
+            # Ellipsis is the quantum placeholder value set during bootstrap.
             if value is not ... and name in getattr(self, "_meta_fields", ()):
                 current = _MISSING
                 try:
@@ -495,7 +502,7 @@ class MathObject(metaclass=MathMeta):
                 except AttributeError:
                     current = _MISSING
                 if current is not _MISSING and current != value and sys.getrefcount(self) > _UNIQUE_REFCOUNT_THRESHOLD:
-                    raise RuntimeError("Shared instance mutation blocked; call clone() before modifying fields.")
+                    raise RuntimeError(f"Shared instance mutation blocked for field '{name}'; call clone() before modifying fields.")
 
         object.__setattr__(self, name, value)
 
