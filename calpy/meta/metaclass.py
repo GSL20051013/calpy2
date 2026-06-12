@@ -15,9 +15,9 @@ else:
 _OVERLOADS_KEY = "__cy_overloads__"
 _QUANTUM_KEY = "__cy_quantum_methods__"
 _MISSING = object()
-# CPython refcount includes temporary call-stack references, so "3" maps to
+# CPython refcount includes temporary call-stack references, so "4" maps to
 # one effective external owner for this object in our write path.
-_UNIQUE_REFCOUNT_THRESHOLD = 3
+_UNIQUE_REFCOUNT_THRESHOLD = 4
 _IMMUTABLE_CLONE_TYPES = (int, float, bool, str, bytes, tuple, frozenset, type(None), Fraction)
 
 _ALGEBRAIC_FALLBACKS = {
@@ -93,6 +93,8 @@ def _matches_annotation(value: Any, annotation: Any) -> bool:
 def _coerce_value(value: Any, annotation: Any) -> Any:
     if value is None:
         return value
+    if annotation in (Any, object, inspect.Signature.empty):
+        return value
     origin = get_origin(annotation)
     if origin is Annotated:
         annotation = get_args(annotation)[0]
@@ -158,6 +160,44 @@ def _build_dispatcher(name: str, overloads: list[types.FunctionType], cls: type)
     return dispatcher
 
 
+def _install_algebraic_fallbacks(cls: type) -> None:
+    if "__add__" in cls.__dict__ and "__radd__" not in cls.__dict__:
+        def __radd__(self, other):
+            return self.__add__(other)
+
+        setattr(cls, "__radd__", __radd__)
+
+    if "__add__" in cls.__dict__ and "__sub__" not in cls.__dict__:
+        def __sub__(self, other):
+            return self + (-other)
+
+        setattr(cls, "__sub__", __sub__)
+
+    if "__add__" in cls.__dict__ and "__rsub__" not in cls.__dict__:
+        def __rsub__(self, other):
+            return (-self) + other
+
+        setattr(cls, "__rsub__", __rsub__)
+
+    if "__mul__" in cls.__dict__ and "__rmul__" not in cls.__dict__:
+        def __rmul__(self, other):
+            return self.__mul__(other)
+
+        setattr(cls, "__rmul__", __rmul__)
+
+    if "__inverse__" in cls.__dict__ and "__truediv__" not in cls.__dict__:
+        def __truediv__(self, other):
+            return self * other.__inverse__()
+
+        setattr(cls, "__truediv__", __truediv__)
+
+    if "__inverse__" in cls.__dict__ and "__rtruediv__" not in cls.__dict__:
+        def __rtruediv__(self, other):
+            return other * self.__inverse__()
+
+        setattr(cls, "__rtruediv__", __rtruediv__)
+
+
 @dataclass_transform(eq_default=True)
 class MathMeta(type):
     _flyweight_pool: weakref.WeakValueDictionary
@@ -190,6 +230,14 @@ class MathMeta(type):
 
             if field in raw_namespace:
                 current_defaults[field] = raw_namespace.pop(field)
+
+        for qfield in quantum_methods:
+            if qfield not in current_fields:
+                current_fields.append(qfield)
+                current_types[qfield] = Any
+                current_defaults[qfield] = ...
+            if qfield in raw_namespace:
+                raw_namespace.pop(qfield)
 
         base_fields = []
         base_types = {}
@@ -276,6 +324,26 @@ class MathMeta(type):
                 raise TypeError(f"Unexpected keyword arguments: {unknown}")
 
         setattr(cls, "__init__", __init__)
+        init_params = []
+        for field in cls._meta_fields:
+            annotation = cls._meta_types.get(field, inspect.Signature.empty)
+            init_params.append(
+                inspect.Parameter(
+                    field,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    default=inspect.Parameter.empty,
+                    annotation=annotation,
+                )
+            )
+        init_params.extend(
+            (
+                inspect.Parameter("_post_args", inspect.Parameter.VAR_POSITIONAL),
+                inspect.Parameter("_post_kwargs", inspect.Parameter.VAR_KEYWORD),
+            )
+        )
+        init_signature = inspect.Signature(parameters=init_params)
+        __init__.__signature__ = init_signature
+        cls.__signature__ = init_signature
 
         def __repr__(self):
             parts = ", ".join(f"{f}={getattr(self, f)!r}" for f in self._meta_fields if hasattr(self, f))
@@ -326,6 +394,8 @@ class MathMeta(type):
 
             setattr(cls, "__enter__", __enter__)
             setattr(cls, "__exit__", __exit__)
+
+        _install_algebraic_fallbacks(cls)
 
         for attr_name, attr_value in list(cls.__dict__.items()):
             if attr_name.startswith("__") or attr_name in {"clone"}:
@@ -390,6 +460,14 @@ class MathObject(metaclass=MathMeta):
             for validator in validators:
                 if not validator(value):
                     raise ValueError(f"Boundary failed for '{name}' with value {value!r}")
+            if value is not ... and name in getattr(self, "_meta_fields", ()):
+                current = _MISSING
+                try:
+                    current = object.__getattribute__(self, name)
+                except AttributeError:
+                    current = _MISSING
+                if current is not _MISSING and current != value and sys.getrefcount(self) > _UNIQUE_REFCOUNT_THRESHOLD:
+                    raise RuntimeError("Shared instance mutation blocked; call clone() before modifying fields.")
 
         object.__setattr__(self, name, value)
 
