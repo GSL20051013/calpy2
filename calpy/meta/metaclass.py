@@ -1,11 +1,12 @@
 import copy
 from functools import wraps
 import inspect
+from numbers import Number
 import sys
 import types
 import weakref
 from fractions import Fraction
-from typing import Annotated, Any, ClassVar, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, Callable, ClassVar, get_args, get_origin, get_type_hints
 
 if sys.version_info >= (3, 11):
     from typing import dataclass_transform
@@ -116,6 +117,61 @@ def _coerce_value(value: Any, annotation: Any) -> Any:
         except Exception:
             return value
     return value
+
+
+def _build_range_validator(lower: Any, upper: Any) -> Callable[[Any], bool]:
+    """Create an inclusive min/max validator."""
+    def _validator(value: Any) -> bool:
+        try:
+            if lower is not None and value < lower:
+                return False
+            if upper is not None and value > upper:
+                return False
+        except TypeError:
+            return False
+        return True
+
+    return _validator
+
+
+def _validate_numeric_bounds(lower: Any, upper: Any) -> bool:
+    if lower is None and upper is None:
+        return False
+    if lower is not None and upper is not None and lower > upper:
+        raise TypeError("Annotated numeric bounds require lower <= upper.")
+    return True
+
+
+def _parse_annotated_bounds(metadata: tuple[Any, ...]) -> list:
+    """Parse `Annotated` metadata into callable boundary validators."""
+    validators = []
+    numeric_limits = []
+
+    for meta in metadata:
+        if callable(meta):
+            validators.append(meta)
+            continue
+        if isinstance(meta, (tuple, list)) and len(meta) == 2:
+            lower, upper = meta
+            if (lower is None or isinstance(lower, Number)) and (upper is None or isinstance(upper, Number)):
+                if _validate_numeric_bounds(lower, upper):
+                    validators.append(_build_range_validator(lower, upper))
+            else:
+                raise TypeError("Annotated tuple/list bounds must be numbers or None.")
+            continue
+        if meta is None or isinstance(meta, Number):
+            numeric_limits.append(meta)
+
+    if len(numeric_limits) == 1:
+        raise TypeError("Annotated numeric bounds require both lower and upper values.")
+    if len(numeric_limits) > 2:
+        raise TypeError("Annotated numeric bounds accept at most two values: lower and upper.")
+    if len(numeric_limits) == 2:
+        lower, upper = numeric_limits
+        if _validate_numeric_bounds(lower, upper):
+            validators.append(_build_range_validator(lower, upper))
+
+    return validators
 
 
 def _build_dispatcher(name: str, overloads: list[types.FunctionType], cls: type):
@@ -250,7 +306,7 @@ class MathMeta(type):
             if get_origin(annotation) is Annotated:
                 args = get_args(annotation)
                 current_types[field] = args[0]
-                current_bounds[field] = [meta for meta in args[1:] if callable(meta)]
+                current_bounds[field] = _parse_annotated_bounds(args[1:])
             else:
                 current_types[field] = annotation
 
